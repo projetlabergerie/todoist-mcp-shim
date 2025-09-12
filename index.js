@@ -7,23 +7,28 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const TODOIST_API = "https://api.todoist.com/api/v1";
-const TOKEN = process.env.TODOIST_API_TOKEN || process.env.TODOIST_TOKEN || process.env.TODOIST;
+const TOKEN =
+  process.env.TODOIST_API_TOKEN || process.env.TODOIST_TOKEN || process.env.TODOIST;
+
 if (!TOKEN) {
-  console.error("[ERROR] You must set TODOIST_API_TOKEN in the environment.");
+  console.error("[ERROR] Set TODOIST_API_TOKEN in the environment");
   process.exit(1);
 }
 
 function getServer() {
-  const server = new McpServer({ name: "todoist-mcp-shim", version: "1.0.0" });
+  const server = new McpServer({ name: "todoist-mcp-shim", version: "1.0.1" });
 
-  // --- Tool: search ---
+  // --- search ---
   server.registerTool(
     "search",
     {
       title: "Search Todoist",
-      description: "Search tasks using Todoist filter syntax (e.g. 'next 7 days & project: Volunteers')",
+      description:
+        "Search tasks using Todoist filter syntax (e.g. 'next 7 days & project: Volunteers')",
       inputSchema: {
-        query: z.string().describe('Todoist filter, e.g. "next 7 days & project: Volunteers"'),
+        query: z.string().describe(
+          'Todoist filter, e.g. "next 7 days & project: Volunteers"'
+        ),
         limit: z.number().int().min(1).max(200).optional(),
       },
     },
@@ -31,18 +36,12 @@ function getServer() {
       const url = new URL(`${TODOIST_API}/tasks/filter`);
       url.searchParams.set("query", query);
       url.searchParams.set("limit", String(limit));
-
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${TOKEN}` },
-      });
-
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
       const text = await res.text();
-      if (!res.ok) {
-        return { content: [{ type: "text", text: `Todoist error ${res.status}: ${text}` }] };
-      }
+      if (!res.ok) return { content: [{ type: "text", text: `Todoist error ${res.status}: ${text}` }] };
+
       const data = JSON.parse(text);
       const results = Array.isArray(data?.results) ? data.results : [];
-
       const links = results.map((t) => ({
         type: "resource_link",
         uri: `todoist://task/${t.id}`,
@@ -50,13 +49,11 @@ function getServer() {
         mimeType: "application/json",
         description: `${t.due?.date ?? "no date"} • project ${t.project_id}`,
       }));
-
-      const summary = `Found ${results.length} task(s) for "${query}".`;
-      return { content: [{ type: "text", text: summary }, ...links] };
+      return { content: [{ type: "text", text: `Found ${results.length} task(s) for "${query}".` }, ...links] };
     }
   );
 
-  // --- Tool: fetch ---
+  // --- fetch ---
   server.registerTool(
     "fetch",
     {
@@ -70,14 +67,12 @@ function getServer() {
         headers: { Authorization: `Bearer ${TOKEN}` },
       });
       const text = await res.text();
-      if (!res.ok) {
-        return { content: [{ type: "text", text: `Todoist error ${res.status}: ${text}` }] };
-      }
-      return { content: [{ type: "text", text }] }; // JSON as text
+      if (!res.ok) return { content: [{ type: "text", text: `Todoist error ${res.status}: ${text}` }] };
+      return { content: [{ type: "text", text }] };
     }
   );
 
-  // --- Optional: add-task ---
+  // --- add-task (optional write) ---
   server.registerTool(
     "add-task",
     {
@@ -99,9 +94,7 @@ function getServer() {
         body: JSON.stringify({ content, project_id, due_string }),
       });
       const text = await res.text();
-      if (!res.ok) {
-        return { content: [{ type: "text", text: `Todoist error ${res.status}: ${text}` }] };
-      }
+      if (!res.ok) return { content: [{ type: "text", text: `Todoist error ${res.status}: ${text}` }] };
       return { content: [{ type: "text", text }] };
     }
   );
@@ -109,69 +102,67 @@ function getServer() {
   return server;
 }
 
-// --- Express app + Streamable HTTP transport (stateful) ---
 const app = express();
 app.use(express.json());
 
-// CORS: expose Mcp-Session-Id header per MCP SDK docs
+// IMPORTANT: allow any headers; don't restrict allowedHeaders (fixes connector CORS/preflight)
 app.use(
   cors({
-    origin: "*", // For production, restrict this to your domain(s)
+    origin: true,
+    credentials: false,
     exposedHeaders: ["Mcp-Session-Id"],
-    allowedHeaders: ["Content-Type", "mcp-session-id", "Mcp-Session-Id"],
   })
 );
 
-// Keep transports keyed by session id
-const transports = {};
+// Preflight for /mcp
+app.options("/mcp", cors());
 
-// Unified handler for GET/DELETE (SSE notifications & session termination)
-const handleSessionRequest = async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-  const transport = sessionId ? transports[sessionId] : undefined;
-  if (!transport) {
-    res.status(400).send("Invalid or missing session ID");
+// Health checks
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+
+// Friendly GET for /mcp without a session (connector probes this)
+const transports = {};
+app.get("/mcp", async (req, res) => {
+  const sid = req.headers["mcp-session-id"];
+  if (!sid) {
+    res.status(200).json({ status: "ready", message: "Use POST initialize to start an MCP session" });
     return;
   }
+  const transport = transports[sid];
+  if (!transport) return res.status(400).send("Invalid or missing session ID");
   await transport.handleRequest(req, res);
-};
+});
 
-app.get("/mcp", handleSessionRequest);
-app.delete("/mcp", handleSessionRequest);
+// DELETE with/without session
+app.delete("/mcp", async (req, res) => {
+  const sid = req.headers["mcp-session-id"];
+  const transport = sid ? transports[sid] : undefined;
+  if (!transport) return res.status(200).send("ok");
+  await transport.handleRequest(req, res);
+});
 
-// POST: initialize or reuse a session, then handle the request
+// POST: initialize or continue
 app.post("/mcp", async (req, res) => {
   const existingId = req.headers["mcp-session-id"];
   let transport = existingId ? transports[existingId] : undefined;
 
   if (existingId && transport) {
-    // Continue existing session
+    // continue
   } else if (!existingId && isInitializeRequest(req.body)) {
-    // Start a new session
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
-      // If running locally, consider enabling DNS rebinding protection:
-      // enableDnsRebindingProtection: true,
-      // allowedHosts: ["127.0.0.1", "localhost"],
     });
-
-    // Store/remove the transport when session lifecycle changes
-    transport.onsessioninitialized = (sid) => {
-      transports[sid] = transport;
-    };
+    transport.onsessioninitialized = (sid) => (transports[sid] = transport);
     transport.onclose = () => {
       if (transport.sessionId) delete transports[transport.sessionId];
     };
-
-    // Connect a fresh MCP server instance for this transport
     const server = getServer();
     await server.connect(transport);
   } else {
-    res.status(400).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Bad Request: No valid session ID provided" },
-      id: null,
-    });
+    res
+      .status(400)
+      .json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
     return;
   }
 
@@ -179,6 +170,4 @@ app.post("/mcp", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8787;
-app.listen(PORT, () => {
-  console.log(`Todoist MCP shim listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Todoist MCP shim listening on port ${PORT}`));
