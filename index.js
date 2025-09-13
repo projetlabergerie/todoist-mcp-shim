@@ -3,12 +3,13 @@ import cors from "cors";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const TODOIST_API = "https://api.todoist.com/api/v1";
 const TOKEN =
-  process.env.TODOIST_API_TOKEN || process.env.TODOIST_TOKEN || process.env.TODOIST;
+  process.env.TODOIST_API_TOKEN ||
+  process.env.TODOIST_TOKEN ||
+  process.env.TODOIST;
 
 if (!TOKEN) {
   console.error("[ERROR] Set TODOIST_API_TOKEN in the environment");
@@ -16,9 +17,9 @@ if (!TOKEN) {
 }
 
 function getServer() {
-  const server = new McpServer({ name: "todoist-mcp-shim", version: "1.0.1" });
+  const server = new McpServer({ name: "todoist-mcp-shim", version: "1.0.2" });
 
-  // --- search ---
+  // ---- search ----
   server.registerTool(
     "search",
     {
@@ -26,9 +27,9 @@ function getServer() {
       description:
         "Search tasks using Todoist filter syntax (e.g. 'next 7 days & project: Volunteers')",
       inputSchema: {
-        query: z.string().describe(
-          'Todoist filter, e.g. "next 7 days & project: Volunteers"'
-        ),
+        query: z
+          .string()
+          .describe('Todoist filter, e.g. "next 7 days & project: Volunteers"'),
         limit: z.number().int().min(1).max(200).optional(),
       },
     },
@@ -49,11 +50,13 @@ function getServer() {
         mimeType: "application/json",
         description: `${t.due?.date ?? "no date"} • project ${t.project_id}`,
       }));
-      return { content: [{ type: "text", text: `Found ${results.length} task(s) for "${query}".` }, ...links] };
+      return {
+        content: [{ type: "text", text: `Found ${results.length} task(s) for "${query}".` }, ...links],
+      };
     }
   );
 
-  // --- fetch ---
+  // ---- fetch ----
   server.registerTool(
     "fetch",
     {
@@ -72,7 +75,7 @@ function getServer() {
     }
   );
 
-  // --- add-task (optional write) ---
+  // ---- add-task (optional write) ----
   server.registerTool(
     "add-task",
     {
@@ -105,68 +108,76 @@ function getServer() {
 const app = express();
 app.use(express.json());
 
-// IMPORTANT: allow any headers; don't restrict allowedHeaders (fixes connector CORS/preflight)
+// permissive CORS (reflect origin, allow credentials, expose MCP header)
 app.use(
   cors({
     origin: true,
-    credentials: false,
+    credentials: true,
     exposedHeaders: ["Mcp-Session-Id"],
   })
 );
 
-// Preflight for /mcp
-app.options("/mcp", cors());
+// robust preflight for any /mcp path
+app.options("/mcp*", (req, res) => {
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.header("Vary", "Origin");
+  res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  const reqHeaders = req.header("Access-Control-Request-Headers");
+  if (reqHeaders) res.header("Access-Control-Allow-Headers", reqHeaders);
+  res.header("Access-Control-Max-Age", "86400");
+  res.status(204).send();
+});
 
-// Health checks
+// simple health
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// Friendly GET for /mcp without a session (connector probes this)
+// keep transports by session id
 const transports = {};
+function makeTransport() {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+  });
+  transport.onsessioninitialized = (sid) => (transports[sid] = transport);
+  transport.onclose = () => {
+    if (transport.sessionId) delete transports[transport.sessionId];
+  };
+  const server = getServer();
+  // connect async; we don’t await here because StreamableHTTP will buffer until ready
+  server.connect(transport);
+  return transport;
+}
+
+// --- allow SSE-first OR POST-first ---
+
+// HEAD is sometimes probed by clients
+app.head("/mcp", (_req, res) => res.status(200).end());
+
+// GET (SSE notifications). If no session, create one and let transport handle it.
 app.get("/mcp", async (req, res) => {
-  const sid = req.headers["mcp-session-id"];
-  if (!sid) {
-    res.status(200).json({ status: "ready", message: "Use POST initialize to start an MCP session" });
-    return;
-  }
-  const transport = transports[sid];
-  if (!transport) return res.status(400).send("Invalid or missing session ID");
+  let transport = req.headers["mcp-session-id"]
+    ? transports[req.headers["mcp-session-id"]]
+    : undefined;
+  if (!transport) transport = makeTransport(); // allow SSE-first
   await transport.handleRequest(req, res);
 });
 
-// DELETE with/without session
+// POST (JSON-RPC). If no session, create one and accept initialize.
+app.post("/mcp", async (req, res) => {
+  let transport = req.headers["mcp-session-id"]
+    ? transports[req.headers["mcp-session-id"]]
+    : undefined;
+  if (!transport) transport = makeTransport();
+  await transport.handleRequest(req, res, req.body);
+});
+
+// DELETE (close)
 app.delete("/mcp", async (req, res) => {
-  const sid = req.headers["mcp-session-id"];
-  const transport = sid ? transports[sid] : undefined;
+  const transport = req.headers["mcp-session-id"]
+    ? transports[req.headers["mcp-session-id"]]
+    : undefined;
   if (!transport) return res.status(200).send("ok");
   await transport.handleRequest(req, res);
-});
-
-// POST: initialize or continue
-app.post("/mcp", async (req, res) => {
-  const existingId = req.headers["mcp-session-id"];
-  let transport = existingId ? transports[existingId] : undefined;
-
-  if (existingId && transport) {
-    // continue
-  } else if (!existingId && isInitializeRequest(req.body)) {
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-    });
-    transport.onsessioninitialized = (sid) => (transports[sid] = transport);
-    transport.onclose = () => {
-      if (transport.sessionId) delete transports[transport.sessionId];
-    };
-    const server = getServer();
-    await server.connect(transport);
-  } else {
-    res
-      .status(400)
-      .json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
-    return;
-  }
-
-  await transport.handleRequest(req, res, req.body);
 });
 
 const PORT = process.env.PORT || 8787;
