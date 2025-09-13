@@ -17,7 +17,7 @@ if (!TOKEN) {
 }
 
 function getServer() {
-  const server = new McpServer({ name: "todoist-mcp-shim", version: "1.0.2" });
+  const server = new McpServer({ name: "todoist-mcp-shim", version: "1.0.4" });
 
   // ---- search ----
   server.registerTool(
@@ -27,9 +27,7 @@ function getServer() {
       description:
         "Search tasks using Todoist filter syntax (e.g. 'next 7 days & project: Volunteers')",
       inputSchema: {
-        query: z
-          .string()
-          .describe('Todoist filter, e.g. "next 7 days & project: Volunteers"'),
+        query: z.string().describe('Todoist filter, e.g. "next 7 days & project: Volunteers"'),
         limit: z.number().int().min(1).max(200).optional(),
       },
     },
@@ -50,9 +48,7 @@ function getServer() {
         mimeType: "application/json",
         description: `${t.due?.date ?? "no date"} • project ${t.project_id}`,
       }));
-      return {
-        content: [{ type: "text", text: `Found ${results.length} task(s) for "${query}".` }, ...links],
-      };
+      return { content: [{ type: "text", text: `Found ${results.length} task(s) for "${query}".` }, ...links] };
     }
   );
 
@@ -75,7 +71,7 @@ function getServer() {
     }
   );
 
-  // ---- add-task (optional write) ----
+  // ---- add-task ----
   server.registerTool(
     "add-task",
     {
@@ -108,16 +104,16 @@ function getServer() {
 const app = express();
 app.use(express.json());
 
-// permissive CORS (reflect origin, allow credentials, expose MCP header)
+// Permissive CORS for browser-based clients (ChatGPT)
+// - expose Mcp-Session-Id so the client can maintain sessions
+// - reflect requested headers so preflight passes
 app.use(
   cors({
     origin: true,
-    credentials: true,
+    credentials: false,
     exposedHeaders: ["Mcp-Session-Id"],
   })
 );
-
-// robust preflight for any /mcp path
 app.options("/mcp*", (req, res) => {
   res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
   res.header("Vary", "Origin");
@@ -128,11 +124,10 @@ app.options("/mcp*", (req, res) => {
   res.status(204).send();
 });
 
-// simple health
+// Health
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-// keep transports by session id
 const transports = {};
 function makeTransport() {
   const transport = new StreamableHTTPServerTransport({
@@ -143,27 +138,41 @@ function makeTransport() {
     if (transport.sessionId) delete transports[transport.sessionId];
   };
   const server = getServer();
-  // connect async; we don’t await here because StreamableHTTP will buffer until ready
   server.connect(transport);
   return transport;
 }
 
-// --- allow SSE-first OR POST-first ---
+// Helper: ensure Accept header has both types (spec requires it)
+function ensureAcceptHeader(req) {
+  const raw = String(req.headers["accept"] || "");
+  if (!raw.includes("application/json") || !raw.includes("text/event-stream")) {
+    const parts = [];
+    if (!raw.includes("application/json")) parts.push("application/json");
+    if (!raw.includes("text/event-stream")) parts.push("text/event-stream");
+    req.headers["accept"] = (raw ? raw + ", " : "") + parts.join(", ");
+  }
+}
 
-// HEAD is sometimes probed by clients
-app.head("/mcp", (_req, res) => res.status(200).end());
-
-// GET (SSE notifications). If no session, create one and let transport handle it.
+// GET /mcp
+// - If Accept includes SSE, stream.
+// - If not (browser probe), return a friendly JSON so ChatGPT’s validator doesn’t fail.
 app.get("/mcp", async (req, res) => {
-  let transport = req.headers["mcp-session-id"]
-    ? transports[req.headers["mcp-session-id"]]
-    : undefined;
-  if (!transport) transport = makeTransport(); // allow SSE-first
-  await transport.handleRequest(req, res);
+  const accept = String(req.headers.accept || "");
+  if (accept.includes("text/event-stream")) {
+    ensureAcceptHeader(req);
+    let transport = req.headers["mcp-session-id"]
+      ? transports[req.headers["mcp-session-id"]]
+      : undefined;
+    if (!transport) transport = makeTransport();
+    await transport.handleRequest(req, res);
+    return;
+  }
+  res.status(200).json({ status: "ready", tools: ["search", "fetch", "add-task"] });
 });
 
-// POST (JSON-RPC). If no session, create one and accept initialize.
+// POST /mcp (JSON-RPC)
 app.post("/mcp", async (req, res) => {
+  ensureAcceptHeader(req); // <-- critical workaround for ChatGPT’s first POST
   let transport = req.headers["mcp-session-id"]
     ? transports[req.headers["mcp-session-id"]]
     : undefined;
@@ -171,7 +180,7 @@ app.post("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// DELETE (close)
+// DELETE /mcp (close)
 app.delete("/mcp", async (req, res) => {
   const transport = req.headers["mcp-session-id"]
     ? transports[req.headers["mcp-session-id"]]
