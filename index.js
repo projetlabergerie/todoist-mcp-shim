@@ -5,6 +5,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
+console.log("todoist-mcp-shim START v1.0.4");
+
 const TODOIST_API = "https://api.todoist.com/api/v1";
 const TOKEN =
   process.env.TODOIST_API_TOKEN ||
